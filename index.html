@@ -31,37 +31,55 @@
     <!-- MAIN CONTENT -->
     <div id="main_content_wrap" class="outer">
       <section id="main_content" class="inner">
-        <h3>
-<a name="welcome-to-github-pages" class="anchor" href="#welcome-to-github-pages"><span class="octicon octicon-link"></span></a>Welcome to GitHub Pages.</h3>
+        <p>This repository hosts modifications to the Linux kernel to enable forward error correction (FEC) in TCP.
+The technique is described as the "Corrective" approach in our SIGCOMM 2013 publication titled <a href="http://research.google.com/pubs/pub41217.html">"Reducing Web Latency: The Virtue of Gentle Aggression"</a>.</p>
 
-<p>This automatic page generator is the easiest way to create beautiful pages for all of your projects. Author your page content here using GitHub Flavored Markdown, select a template crafted by a designer, and publish. After your page is generated, you can check out the new branch:</p>
+<p>The modifications were originally developed for the Linux kernel version 2.6.34 and have since been rebased to version 3.10 - though without extensive testing!</p>
 
-<pre><code>$ cd your_repo_root/repo_name
-$ git fetch origin
-$ git checkout gh-pages
+<p>We invite you to play around with the patches and welcome your feedback. We are also happy to apply bugfixes and future rebases you might have to the existing patch set.</p>
+
+<p>WARNING: Since the modifications have not been tested extensively in the current kernel version, we advise you to execute tests in an isolated environment with an option for a recovery from kernel panics, etc.</p>
+
+<h3>
+<a name="patch-components" class="anchor" href="#patch-components"><span class="octicon octicon-link"></span></a>Patch components</h3>
+
+<p>The changes are grouped into three patches building on top of each other: Common, Receiver, and Sender.
+For a detailed description of the parts implemented by each patch please check the description at the top of each patch file.</p>
+
+<h3>
+<a name="installation" class="anchor" href="#installation"><span class="octicon octicon-link"></span></a>Installation</h3>
+
+<p>To get started fetch the Linux kernel version used as the base for the patch set (here version 3.10):</p>
+
+<pre><code>$ git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+$ cd linux
+$ git checkout tags/v3.10
 </code></pre>
 
-<p>If you're using the GitHub for Mac, simply sync your repository and you'll see the new branch.</p>
+<p>Next, check out the patches (or download them directly). Then apply them in the right order (Common, then Receiver, then Sender):</p>
+
+<pre><code>$ git apply &lt;local path to patches&gt;/0001-net-tcp-TCP-with-Forward-Error-Correction-Common.patch
+$ git apply &lt;local path to patches&gt;/0002-net-tcp-TCP-with-Forward-Error-Correction-Receiver.patch
+$ git apply &lt;local path to patches&gt;/0003-net-tcp-TCP-with-Forward-Error-Correction-Sender.patch
+</code></pre>
+
+<p>All three <code>apply</code> calls do NOT produce any console output if applied correctly.</p>
+
+<p>NOTE: If you want to apply the patches to a different kernel version, keep in mind that the apply step can fail if some changes are conflicted with the changed code base. A possible solution is to apply a patch partially (using the <code>--reject</code> flag when running <code>git apply</code>) and then resolve the conflicts stored in <code>.rej</code> files manually.</p>
+
+<p>Finally, you need to compile and install the modified kernel. There are many tutorials on how to do this out there, so we avoid replicating instructions for this here.</p>
+
+<p>The FEC feature is turned off by default in an environment running with a modified kernel. To enable it run:</p>
+
+<pre><code>sysctl net.ipv4.tcp_fec=1
+</code></pre>
 
 <h3>
-<a name="designer-templates" class="anchor" href="#designer-templates"><span class="octicon octicon-link"></span></a>Designer Templates</h3>
+<a name="testing" class="anchor" href="#testing"><span class="octicon octicon-link"></span></a>Testing</h3>
 
-<p>We've crafted some handsome templates for you to use. Go ahead and continue to layouts to browse through them. You can easily go back to edit your page before publishing. After publishing your page, you can revisit the page generator and switch to another theme. Your Page content will be preserved if it remained markdown format.</p>
+<p>We developed a set of <a href="https://code.google.com/p/packetdrill/">packetdrill</a> test routines to check the proper functionality of the FEC engine. We will publish them in this repository soon.</p>
 
-<h3>
-<a name="rather-drive-stick" class="anchor" href="#rather-drive-stick"><span class="octicon octicon-link"></span></a>Rather Drive Stick?</h3>
-
-<p>If you prefer to not use the automatic generator, push a branch named <code>gh-pages</code> to your repository to create a page manually. In addition to supporting regular HTML content, GitHub Pages support Jekyll, a simple, blog aware static site generator written by our own Tom Preston-Werner. Jekyll makes it easy to create site-wide headers and footers without having to copy them across every page. It also offers intelligent blog support and other advanced templating features.</p>
-
-<h3>
-<a name="authors-and-contributors" class="anchor" href="#authors-and-contributors"><span class="octicon octicon-link"></span></a>Authors and Contributors</h3>
-
-<p>You can <a href="https://github.com/blog/821" class="user-mention">@mention</a> a GitHub username to generate a link to their profile. The resulting <code>&lt;a&gt;</code> element will link to the contributor's GitHub Profile. For example: In 2007, Chris Wanstrath (<a href="https://github.com/defunkt" class="user-mention">@defunkt</a>), PJ Hyett (<a href="https://github.com/pjhyett" class="user-mention">@pjhyett</a>), and Tom Preston-Werner (<a href="https://github.com/mojombo" class="user-mention">@mojombo</a>) founded GitHub.</p>
-
-<h3>
-<a name="support-or-contact" class="anchor" href="#support-or-contact"><span class="octicon octicon-link"></span></a>Support or Contact</h3>
-
-<p>Having trouble with Pages? Check out the documentation at <a href="http://help.github.com/pages">http://help.github.com/pages</a> or contact <a href="mailto:support@github.com">support@github.com</a> and we’ll help you sort it out.</p>
+<p>If you have further questions, feel free to contact any of the contributors.</p>
       </section>
     </div>
 
