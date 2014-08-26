@@ -1,0 +1,949 @@
+From 26339b95439aa587066938965f033e68a0d6f6c5 Mon Sep 17 00:00:00 2001
+From: Tobias Flach <flach@google.com>
+Date: Mon, 25 Aug 2014 16:46:16 -0700
+Subject: [PATCH] net-tcp: TCP with Forward Error Correction (Receiver)
+
+Implemetation of the receiver part of forward error correction in TCP.
+
+Implemented components:
+* Detection of an FEC packet:
+  - FEC-encoded packets have the ENCODED flag set in the FEC flags
+    byte. If a packet does not carry an FEC option at all, the
+    packet is discarded.
+* Payload recovery (decoding):
+  - The receiver keeps up to (currently) 16000 in-order bytes in the
+    buffer for possible recoveries. Data is not duplicated, instead
+    extra references are kept for the in-order SKBs to avoid them
+    being freed once they are consumed by higher layers.
+  - Once an FEC packet is received, the receiver tries to recover
+    any encoded data which was not received yet by reversing the
+    encoding steps.
+  - If a byte block can be reconstructed, an SKB is allocated and
+    a TCP header attached, before the new packet is forwarded to
+    regular reception routines.
+* Acknowledgements:
+  - On successful recovery, every outgoing packet has the FEC flag
+    RECOVERY_SUCCESS enabled. On reception of this flag, the
+    receiver reduces the congestion window (similarly to ECN)
+    and sets the FEC flag RECOVERY_CWR in the next outgoing packet.
+    The RECOVERY_SUCCESS flag is transmitted for every packet until
+    RECOVERY_ACK has been received (similarly to sending ECE until
+    CWR is received in ECN).
+  - On failed recovery, an extra acknowledgement for rcv_nxt is
+    generated. The FEC flag RECOVERY_FAIL is enabled and the remaining
+    24 bits in the option encode the number of bytes after ack_seq
+    which are considered loss. The receiver marks this byte
+    range as lost and can start retransmissions.
+---
+ include/net/tcp_fec.h    |  27 ++
+ net/ipv4/tcp_fec.c       | 732 +++++++++++++++++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_input.c     |  40 ++-
+ net/ipv4/tcp_minisocks.c |   2 +
+ 4 files changed, 798 insertions(+), 3 deletions(-)
+
+diff --git a/include/net/tcp_fec.h b/include/net/tcp_fec.h
+index ba219d1..1660e58 100644
+--- a/include/net/tcp_fec.h
++++ b/include/net/tcp_fec.h
+@@ -50,4 +50,31 @@ int tcp_fec_decode_option(struct tcp_fec *fec, u32 seq, u32 ack_seq,
+ int tcp_fec_encode_option(struct tcp_sock *tp, struct tcp_fec *fec,
+ 			__be32 **ptr);
+ 
++/*
++ * Processes the current packet in the buffer (treated as FEC packet)
++ */
++int tcp_fec_process(struct sock *sk, struct sk_buff *skb);
++
++/*
++ * Checks the received options for loss indicators and acts upon them.
++ * In particular, the function handles window reduction requests and processes
++ * tail loss indicators.
++ * Returns: 1, if window is reduced - 0, otherwise
++ */
++int tcp_fec_check_ack(struct sock *sk, u32 ack_seq);
++
++/*
++ * Since data in the socket's receive queue can get consumed by other parties
++ * we need to keep extra references these SKBs until they are no longer
++ * required for possible future recoveries.
++ * @skb - buffer which is moved to the receive queue
++ */
++int tcp_fec_update_queue(struct sock *sk, struct sk_buff *skb);
++
++/*
++ * Disables FEC for this connection (includes clearing references
++ * to buffers in receive queue)
++ */
++void tcp_fec_disable(struct sock *sk);
++
+ #endif
+diff --git a/net/ipv4/tcp_fec.c b/net/ipv4/tcp_fec.c
+index 97a48ce..3a8bd6d 100644
+--- a/net/ipv4/tcp_fec.c
++++ b/net/ipv4/tcp_fec.c
+@@ -1,5 +1,30 @@
+ #include <net/tcp_fec.h>
+ 
++/* Codes for incoming FEC packet processing */
++#define FEC_NO_LOSS		1
++#define FEC_LOSS_UNRECOVERED	2
++#define FEC_LOSS_RECOVERED	3
++
++/* Receiver routines */
++static int tcp_fec_process_xor(struct sock *sk, const struct sk_buff *skb,
++			unsigned int block_skip);
++static int tcp_fec_recover(struct sock *sk, const struct sk_buff *skb,
++			unsigned char *data, u32 seq, int len);
++static void tcp_fec_send_ack(struct sock *sk, const struct sk_buff *skb,
++			int recovery_status);
++static void tcp_fec_reduce_window(struct sock *sk);
++static void tcp_fec_mark_skbs_lost(struct sock *sk);
++static bool tcp_fec_update_decoded_option(struct sk_buff *skb);
++static struct sk_buff *tcp_fec_make_decoded_pkt(struct sock *sk,
++			const struct sk_buff *skb, unsigned char *dec_data,
++			u32 seq, unsigned int len);
++
++/* Buffer access routine */
++static unsigned int tcp_fec_get_next_block(struct sock *sk,
++			struct sk_buff **skb, struct sk_buff_head *queue,
++			u32 seq, unsigned int block_len,
++			unsigned char *block);
++
+ /* Decodes FEC parameters and stores them in the FEC struct
+  * @seq - sequence number of the packet
+  * @ack_seq - ACKed sequence number
+@@ -122,3 +147,710 @@ int tcp_fec_encode_option(struct tcp_sock *tp, struct tcp_fec *fec,
+ 		return 8;
+ 	}
+ }
++
++/* Processes the current packet in the buffer, treated as an FEC packet
++ * (assumes that options were already processed)
++ */
++int tcp_fec_process(struct sock *sk, struct sk_buff *skb)
++{
++	struct tcp_sock *tp;
++	struct tcphdr *th;
++	int recovery_status, err;
++	u32 end_seq;
++
++	tp = tcp_sk(sk);
++	th = tcp_hdr(skb);
++	recovery_status = 0;
++
++	/* drop packet if packet is not encoded */
++	if (!(tp->rx_opt.fec.flags & TCP_FEC_ENCODED))
++		return -1;
++
++	/* check if all encoded packets were already received */
++	end_seq = tp->rx_opt.fec.enc_seq + tp->rx_opt.fec.enc_len;
++	if (!after(end_seq, tp->rcv_nxt)) {
++		tcp_fec_send_ack(sk, skb, FEC_NO_LOSS);
++		return 0;
++	}
++
++	/* linearize the SKB (for easier payload access) */
++	err = skb_linearize(skb);
++	if (err)
++		return err;
++
++	/* data recovery */
++	switch (tp->fec.type) {
++	case TCP_FEC_TYPE_NONE:
++		return -1;
++	case TCP_FEC_TYPE_XOR_ALL:
++		recovery_status = tcp_fec_process_xor(sk, skb, 0);
++		break;
++	case TCP_FEC_TYPE_XOR_SKIP_1:
++		recovery_status = tcp_fec_process_xor(sk, skb, 1);
++		break;
++	}
++
++	/* TODO error handling; -ENOMEM, etc. - disable FEC? */
++	if (recovery_status < 0)
++		return recovery_status;
++
++	/* Send an explicit ACK if recovery failed */
++	if (recovery_status == FEC_LOSS_UNRECOVERED)
++		tcp_fec_send_ack(sk, skb, recovery_status);
++
++	return 0;
++}
++
++/* Checks the received options for loss indicators and acts upon them.
++ * In particular, the function handles recovery flags (indicators for
++ * successful and failed recoveries, tail losses)
++ * Returns: 1, if ACK contains a loss indicator
++ */
++int tcp_fec_check_ack(struct sock *sk, u32 ack_seq)
++{
++	struct tcp_sock *tp;
++
++	tp = tcp_sk(sk);
++
++	/* Clear local recovery indication (and ECN CWR demand)
++	 * if it was ACKED by the other node
++	 */
++	if (tp->rx_opt.fec.flags & TCP_FEC_RECOVERY_CWR) {
++		tp->fec.flags &= ~TCP_FEC_RECOVERY_SUCCESSFUL;
++		tp->ecn_flags &= ~TCP_ECN_DEMAND_CWR;
++	}
++
++	/* Check for tail loss indicators
++	 * This happens when FEC was unable to recover the lost data and
++	 * thus only sends an ACK with the loss range back. Everything not
++	 * ACKed/SACKed now, is considered lost now.
++	 */
++	if (tp->rx_opt.fec.flags & TCP_FEC_RECOVERY_FAILED) {
++		tcp_fec_mark_skbs_lost(sk);
++		return 1;
++	}
++
++	/* Check if the remote endpoint successfully recovered data,
++	 * if so we trigger a window reduction
++	 */
++	if (tp->rx_opt.fec.flags & TCP_FEC_RECOVERY_SUCCESSFUL) {
++		/* Ignore flag if window was already reduced for the current
++		 * loss episode or if previous reduction was not signaled
++		 * yet (no outgoing packets)
++		 */
++		if (after(ack_seq, tp->high_seq) &&
++				!(tp->fec.flags & TCP_FEC_RECOVERY_CWR)) {
++			tcp_fec_reduce_window(sk);
++			tp->fec.flags |= TCP_FEC_RECOVERY_CWR;
++		}
++
++		return 1;
++	}
++
++	return 0;
++}
++
++/* Since data in the socket's receive queue can get consumed by other parties
++ * we need to clone these SKBs until they are no longer required for possible
++ * future recoveries. This function is called after the TCP header has been
++ * removed from the SKB already. All parameters required for recovery are
++ * stored in the SKB's control buffer.
++ * @skb - buffer which is moved to the receive queue
++ */
++int tcp_fec_update_queue(struct sock *sk, struct sk_buff *skb)
++{
++	struct tcp_sock *tp;
++	struct sk_buff *cskb;
++	u32 data_len;
++	int extra_bytes, err;
++	tp = tcp_sk(sk);
++
++	/* clone the SKB and add it to the FEC receive queue
++	 * (a simple extra reference to the SKB is not sufficient since
++	 * since SKBs can only be queued on one list at a time)
++	 */
++	cskb = skb_clone(skb, GFP_ATOMIC);
++	if (cskb == NULL)
++		return -ENOMEM;
++
++	/* linearize the SKB (for easier payload access) */
++	err = skb_linearize(cskb);
++	if (err)
++		return err;
++
++	data_len = skb->len;
++	if (!data_len) {
++		kfree_skb(cskb);
++		return 0;
++	}
++
++	skb_queue_tail(&tp->fec.rcv_queue, cskb);
++	tp->fec.bytes_rcv_queue += data_len;
++
++	/* check if we can dereference old SKBs (as long as we have enough
++	 * data for future recoveries)
++	 */
++	extra_bytes = tp->fec.bytes_rcv_queue - FEC_RCV_QUEUE_LIMIT;
++	while (extra_bytes > 0) {
++		cskb = skb_peek(&tp->fec.rcv_queue);
++		if (cskb == NULL)
++			return -EINVAL;
++
++		data_len = TCP_SKB_CB(cskb)->end_seq - TCP_SKB_CB(cskb)->seq;
++		if (data_len > extra_bytes) {
++			break;
++		} else {
++			extra_bytes -= data_len;
++			tp->fec.bytes_rcv_queue -= data_len;
++			skb_unlink(cskb, &tp->fec.rcv_queue);
++			kfree_skb(cskb);
++		}
++	}
++
++	return 0;
++}
++
++/* Disables FEC for this connection (includes clearing references
++ * to buffers in receive queue)
++ */
++void tcp_fec_disable(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++
++	if (!tcp_fec_is_enabled(tp))
++		return;
++
++	tp->fec.type = 0;
++	tp->fec.bytes_rcv_queue = 0;
++	skb_queue_purge(&tp->fec.rcv_queue);
++}
++
++/* Processes the current packet in the buffer, treated as an FEC packet
++ * with XOR-encoded payload (assumes that options were already processed)
++ * Returns: negative code, if an error occurred;
++ *	positive code, otherwise (recovery status)
++ * @block_skip - Number of unencoded blocks between two encoded blocks
++ */
++static int tcp_fec_process_xor(struct sock *sk, const struct sk_buff *skb,
++			unsigned int block_skip)
++{
++	struct sk_buff *pskb;
++	struct tcp_sock *tp;
++	struct tcphdr *th;
++	u32 next_seq, end_seq, rec_seq;
++	unsigned char *data, *block;
++	unsigned int i, offset, data_len, block_len, rec_len;
++	bool seen_loss;
++	int ret;
++
++	pskb = NULL;
++	tp = tcp_sk(sk);
++	th = tcp_hdr(skb);
++	next_seq = tp->rx_opt.fec.enc_seq;
++	end_seq = next_seq + tp->rx_opt.fec.enc_len;
++	block_len = skb->len - tcp_hdrlen(skb);
++	seen_loss = false;
++	offset = 0;
++
++	/* memory allocation for decoding / recovered SKB data */
++	data = kmalloc(2 * block_len, GFP_ATOMIC);
++	if (data == NULL)
++		return -ENOMEM;
++
++	block = data + block_len;
++
++	/* copy FEC payload (skip TCP header) */
++	memcpy(data, skb->data + tcp_hdrlen(skb), block_len);
++
++	/* process in-sequence data */
++	while ((data_len = tcp_fec_get_next_block(sk, &pskb,
++				&tp->fec.rcv_queue, next_seq,
++				min(block_len, end_seq - next_seq),
++				block))) {
++		next_seq += data_len;
++
++		/* XOR with existing payload */
++		for (i = 0; i < data_len; i++)
++			data[i] ^= block[i];
++
++		/* we could no read a whole MSS block, which means we
++		 * reached the end of the queue or end of range which the
++		 * FEC packet covers
++		 */
++		if (data_len < block_len)
++			break;
++
++		/* skip unencoded blocks if there is more data encoded */
++		if (end_seq - next_seq > 0)
++			next_seq += block_len * block_skip;
++	}
++
++	/* check if all encoded bytes were already received */
++	if (next_seq == end_seq) {
++		kfree(data);
++		return FEC_NO_LOSS;
++	}
++
++	/* we always recover one whole MSS block (otherwise slicing
++	 * would introduce a lot of additional complexity here) and handle
++	 * cut out already received sequences later
++	 */
++	rec_seq = next_seq;
++	rec_len = min(block_len, end_seq - rec_seq);
++	offset  = data_len;
++	if ((rec_seq + rec_len) == end_seq)
++		goto recover;
++
++	next_seq += block_len * (block_skip + 1);
++	pskb = NULL;
++
++	/* read a possibly partial (smaller than MSS) block to fill up the
++	 * previously unfilled block and achieve alignment again
++	 */
++	data_len = tcp_fec_get_next_block(sk, &pskb, &tp->out_of_order_queue,
++				next_seq, block_len - offset, block);
++
++	next_seq += data_len;
++
++	/* check if we could not read as much data as requested */
++	if ((next_seq != end_seq) && (data_len < (block_len - offset)))
++		goto clean;
++
++	/* XOR with existing payload */
++	for (i = 0; i < data_len; i++)
++		data[i+offset] ^= block[i];
++
++	/* skip unencoded blocks if there is more data encoded */
++	if (end_seq - next_seq > 0)
++		next_seq += block_len * block_skip;
++
++	/* read all necessary blocks to finish decoding */
++	while ((data_len = tcp_fec_get_next_block(sk, &pskb,
++				&tp->out_of_order_queue, next_seq,
++				min(block_len, end_seq - next_seq),
++				block))) {
++		next_seq += data_len;
++
++		/* XOR with existing payload */
++		for (i = 0; i < data_len; i++)
++			data[i] ^= block[i];
++
++		/* we could not read a whole MSS block, which means we reached
++		 * the end of the queue or end of range which the FEC packet
++		 * covers
++		 */
++		if (data_len < block_len)
++			break;
++
++		/* skip unencoded blocks if there is more data encoded */
++		if (end_seq - next_seq > 0)
++			next_seq += block_len * block_skip;
++	}
++
++	/* check if additional losses were observed (cannot recover) */
++	if (next_seq != end_seq)
++		goto clean;
++
++recover:
++	/* create and process recovered packets */
++	for (i = 0; i < rec_len; i++)
++		block[i] = data[(offset + i) % block_len];
++
++	if (block_skip && ((block_len - offset) < rec_len)) {
++		/* recover non-consecutive sequence ranges (only when
++		 * slicing is used)
++		 */
++		u32 second_seq;
++		unsigned int second_seq_len, first_seq_len;
++
++		first_seq_len = block_len - offset;
++		second_seq = rec_seq + first_seq_len + block_len * block_skip;
++		second_seq_len = rec_len - first_seq_len;
++
++		ret = tcp_fec_recover(sk, skb, block, rec_seq, first_seq_len);
++		if (ret >= 0) {
++			int second_ret = tcp_fec_recover(sk, skb,
++						block + first_seq_len,
++						second_seq, second_seq_len);
++			if (second_ret < 0 || !ret)
++				ret = second_ret;
++		}
++	} else {
++		ret = tcp_fec_recover(sk, skb, block, rec_seq, rec_len);
++	}
++
++	kfree(data);
++	return ret ? ret : FEC_LOSS_RECOVERED;
++
++clean:
++        kfree(data);
++        return FEC_LOSS_UNRECOVERED;
++}
++
++/* Create a recovered packet and forward it to the reception routine */
++static int tcp_fec_recover(struct sock *sk, const struct sk_buff *skb,
++		unsigned char *data, u32 seq, int len)
++{
++	struct sk_buff *rskb;
++	struct tcp_sock *tp;
++
++	tp = tcp_sk(sk);
++
++	/* We will notify the remote node that recovery was successful */
++	tp->fec.flags |= TCP_FEC_RECOVERY_SUCCESSFUL;
++
++	/* Check if we received some tail of the recovered sequence already
++	 * by looking at the current SACK blocks (we don't want to recover
++	 * more data than necessary to prevent DSACKS)
++	 */
++	if (tcp_is_sack(tp)) {
++		int i;
++		for (i = 0; i < tp->rx_opt.num_sacks; i++) {
++			if (before(tp->selective_acks[i].start_seq,
++				   seq + len) &&
++			   !before(tp->selective_acks[i].end_seq,
++				   seq + len)) {
++				len = tp->selective_acks[i].start_seq - seq;
++				break;
++			}
++		}
++	}
++
++	/* We might have prematurely asked for a recovery in the case where the
++	 * whole recovery sequence is already covered by SACKs
++	 */
++	if (len <= 0)
++		return FEC_NO_LOSS;
++
++	/* Create decoded packet and forward to reception routine */
++	rskb = tcp_fec_make_decoded_pkt(sk, skb, data, seq, len);
++	if (rskb == NULL)
++		return -EINVAL;
++
++	return tcp_rcv_established(sk, rskb, tcp_hdr(rskb), rskb->len);
++}
++
++/* Sends an ACK for the FEC packet and encodes any congestion or
++ * and/or recovery information
++ */
++static void tcp_fec_send_ack(struct sock *sk, const struct sk_buff *skb,
++				int recovery_status)
++{
++	struct tcp_sock *tp;
++	u32 end_seq;
++
++	tp = tcp_sk(sk);
++
++	/* Right now we only need an outgoing ACK if FEC recovery failed,
++	 * in all other cases ACKs are implicitly generated
++	 */
++	switch (recovery_status) {
++	case FEC_LOSS_UNRECOVERED:
++		end_seq = tp->rx_opt.fec.enc_seq + tp->rx_opt.fec.enc_len;
++		tp->fec.flags |= TCP_FEC_RECOVERY_FAILED;
++		tp->fec.lost_len = end_seq - tp->rcv_nxt;
++		tcp_send_ack(sk);
++		break;
++	}
++}
++
++/* Reduces the congestion window (similar to completed fast recovery)
++ * If the node is already in recovery mode, undo is disabled to enforce
++ * the window reduction upon completion
++ */
++static void tcp_fec_reduce_window(struct sock *sk)
++{
++	struct tcp_sock *tp;
++	const struct inet_connection_sock *icsk;
++
++	tp = tcp_sk(sk);
++	icsk = inet_csk(sk);
++
++	if (icsk->icsk_ca_state < TCP_CA_CWR) {
++		tp->snd_ssthresh = icsk->icsk_ca_ops->ssthresh(sk);
++		if (tp->snd_ssthresh < TCP_INFINITE_SSTHRESH) {
++			tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_ssthresh);
++			tp->snd_cwnd_stamp = tcp_time_stamp;
++		}
++
++		/* Any future window reduction requests are ignored until
++		 * snd_nxt is ACKed
++		 */
++		tp->high_seq = tp->snd_nxt;
++		tp->undo_marker = 0;
++	} else {
++		/* Socket is in some congestion mode and we only need to make
++		 * sure that window reduction is executed when recovery
++		 * is finished
++		 */
++		tp->undo_marker = 0;
++	}
++}
++
++/* The incoming ACK indicates a failed recovery.
++ * Mark all unacked SKBs in the loss range as lost.
++ * TODO With interleaved coding, we have the additional constraint
++ * that the SKBs in the loss range also must have been encoded the
++ * triggering FEC packet, and for that we need to keep some info
++ * about FEC packets on the sender side
++ */
++static void tcp_fec_mark_skbs_lost(struct sock *sk)
++{
++	struct tcp_sock *tp;
++	struct sk_buff *skb;
++	u32 start_seq, end_seq;
++
++	tp = tcp_sk(sk);
++	skb = tp->lost_skb_hint ? tp->lost_skb_hint : tcp_write_queue_head(sk);
++
++	/* All SKBs falling completely in the range are marked */
++	start_seq = tp->rx_opt.fec.lost_seq;
++	end_seq = tp->rx_opt.fec.lost_seq + tp->rx_opt.fec.lost_len;
++
++	tcp_for_write_queue_from(skb, sk) {
++		if (skb == tcp_send_head(sk))
++			break;
++
++		/* Past loss range */
++		if (!before(TCP_SKB_CB(skb)->seq, end_seq))
++			break;
++
++		/* SKB not (fully) within range */
++		if (before(TCP_SKB_CB(skb)->seq, start_seq) ||
++		    after(TCP_SKB_CB(skb)->end_seq, end_seq))
++			continue;
++
++		/* SKB already marked */
++		if (TCP_SKB_CB(skb)->sacked & (TCPCB_LOST|TCPCB_SACKED_ACKED))
++			continue;
++
++		/* Verify retransmit hint before marking
++		 * (see tcp_verify_retransmit_hint(),
++		 * copied since method defined static in tcp_input.c)
++		 */
++		if ((tp->retransmit_skb_hint == NULL) ||
++		    before(TCP_SKB_CB(skb)->seq,
++			   TCP_SKB_CB(tp->retransmit_skb_hint)->seq))
++			tp->retransmit_skb_hint = skb;
++
++		if (!tp->lost_out ||
++		    after(TCP_SKB_CB(skb)->end_seq, tp->retransmit_high))
++			tp->retransmit_high = TCP_SKB_CB(skb)->end_seq;
++
++		/* Mark SKB as lost (see tcp_skb_mark_lost()) */
++		tp->lost_out += tcp_skb_pcount(skb);
++		TCP_SKB_CB(skb)->sacked |= TCPCB_LOST;
++	}
++
++	tcp_verify_left_out(tp);
++}
++
++/* Searches for the FEC option in the packet header and replaces
++ * the long option with a short one padded by NOPs.
++ * This is done to convert the option used by an encoded packet
++ * to the option used by a recovered packet.
++ */
++static bool tcp_fec_update_decoded_option(struct sk_buff *skb)
++{
++	struct tcphdr *th;
++	unsigned char *ptr;
++	int length;
++
++	th = tcp_hdr(skb);
++	ptr = (unsigned char *) (th + 1);
++	length = (th->doff * 4) - sizeof(struct tcphdr);
++
++	while (length > 0) {
++		int opcode = *ptr++;
++		int opsize;
++
++		switch (opcode) {
++		case TCPOPT_EOL:
++			return 0;
++		case TCPOPT_NOP:
++			length--;
++			continue;
++		default:
++			opsize = *ptr++;
++			if (opsize < 2 || opsize > length)
++				return 0;
++
++			if (opcode == TCPOPT_EXP &&
++				get_unaligned_be16(ptr) == TCPOPT_FEC_MAGIC) {
++				/* Update FEC option:
++				 * 1. Convert long option into short option
++				 * 2. Clear ENCODED flag (keep other flags)
++				 * 3. Replace option value (long option) by NOPs
++				 */
++				u32 *fec_opt_start = (u32 *) (ptr - 2);
++				*fec_opt_start = htonl((
++					get_unaligned_be32(fec_opt_start) &
++					0xFF00FFFF) | 0x00050000);
++				*(fec_opt_start + 1) = htonl((
++					get_unaligned_be32(fec_opt_start + 1) &
++					0xEF000000) | 0x00010101);
++
++				return 1;
++			}
++
++			ptr += opsize - 2;
++			length -= opsize;
++		}
++	}
++
++	return 0;
++}
++
++/* Allocates an SKB for data we want to forward to reception routines
++ * (recovered data) by making a copy of the FEC SKB and replacing the data
++ * part, all other segments (options, etc.) are preserved
++ */
++static struct sk_buff *tcp_fec_make_decoded_pkt(struct sock *sk,
++				const struct sk_buff *skb,
++				unsigned char *dec_data,
++				u32 seq, unsigned int len)
++{
++	struct tcp_sock *tp;
++	struct sk_buff *nskb;
++
++	tp = tcp_sk(sk);
++	nskb = skb_copy(skb, GFP_ATOMIC);
++	if (nskb == NULL)
++		return NULL;
++
++	/* Update FEC option for the new packet */
++	if (!tcp_fec_update_decoded_option(nskb)) {
++		/* TODO Do we need this catch? Technically we don't reach this
++		 * method if there is no FEC option in the header.
++		 */
++		return NULL;
++	}
++
++	/* check if we received some tail of the recovered sequence already
++	 * by looking at the current SACK blocks (we don't want to recover
++	 * more data than necessary to prevent DSACKS)
++	 */
++	if (tcp_is_sack(tp)) {
++		int i;
++		for (i = 0; i < tp->rx_opt.num_sacks; i++) {
++			if (before(tp->selective_acks[i].start_seq,
++				   seq + len) &&
++				   !before(tp->selective_acks[i].end_seq,
++				   seq + len)) {
++				len = tp->selective_acks[i].start_seq - seq;
++				break;
++			}
++		}
++	}
++
++	/* trim data section to fit recovered sequence if necessary */
++	if (len < (TCP_SKB_CB(skb)->end_seq - TCP_SKB_CB(skb)->seq))
++		skb_trim(nskb, len + tcp_hdrlen(nskb));
++
++	/* fix the sequence numbers */
++	tcp_hdr(nskb)->seq = htonl(seq);
++	tcp_hdr(nskb)->ack_seq = htonl(tp->snd_una);
++	TCP_SKB_CB(nskb)->seq = seq;
++	TCP_SKB_CB(nskb)->end_seq = seq + len;
++
++	/* replace SKB payload with recovered data */
++	memcpy(nskb->data + tcp_hdrlen(nskb), dec_data, len);
++
++	/* packets used for recovery had their checksums checked already */
++	nskb->ip_summed = CHECKSUM_UNNECESSARY;
++
++	return nskb;
++}
++
++/* Gets the next byte block from an SKB queue (any SKB which is touched
++ * in this procedure will be linearized to simplify payload access)
++ * @skb - Points to SKB from which previous block was extracted (useful
++ *	  for successive calls to this function, which avoids moving through
++ *	  the whole queue again)
++ * @queue - SKB queue to read from (SKB has to point to an element on this
++ *	  queue)
++ * @seq - Sequence number of first byte in the block
++ * @block_len
++ * @block
++ *
++ * Returns the bytes written to the block memory
++ */
++static unsigned int tcp_fec_get_next_block(struct sock *sk,
++				struct sk_buff **skb,
++				struct sk_buff_head *queue, u32 seq,
++				unsigned int block_len, unsigned char *block)
++{
++	unsigned int cur_len, offset, num_bytes;
++	int err;
++	u32 end_seq;
++
++	cur_len = 0;
++
++	/* Get first SKB of the write queue and specify next sequence to
++	 * encode
++	 */
++	if (*skb == NULL) {
++		*skb = skb_peek(queue);
++		if (*skb == NULL)
++			return 0;
++	}
++
++	/* move to SKB which stores the next sequence to encode */
++	while (*skb) {
++		/* If we observe an RST/SYN, we stop here to avoid
++		 * handling corner cases
++		 */
++		if (TCP_SKB_CB(*skb)->tcp_flags &
++					(TCPHDR_RST |
++					 TCPHDR_SYN))
++			return 0;
++		if (!before(seq, TCP_SKB_CB(*skb)->seq) &&
++					before(seq, TCP_SKB_CB(*skb)->end_seq))
++			break;
++		if (*skb == skb_peek_tail(queue)) {
++			*skb = NULL;
++			break;
++		}
++
++		*skb = skb_queue_next(queue, *skb);
++	}
++
++	if (*skb == NULL)
++		return 0;
++
++	/* copy bytes from SKBs (connected sequences) */
++	while (*skb && (cur_len < block_len)) {
++		err = skb_linearize(*skb);
++		if (err)
++			return err;
++
++		/* Deal with the end seq number being incremented by
++		 * one if the FIN flag is set (we don't want to encode this)
++		 */
++		end_seq = TCP_SKB_CB(*skb)->end_seq;
++		if (TCP_SKB_CB(*skb)->tcp_flags & TCPHDR_FIN)
++			end_seq--;
++
++		if ((seq >= TCP_SKB_CB(*skb)->seq) && (seq < end_seq)) {
++			/* Copy data depending on:
++			 * - remaining space in the block
++			 * - remaining data in the SKB
++			 */
++			offset = seq - TCP_SKB_CB(*skb)->seq;
++			num_bytes = min(block_len - cur_len,
++					end_seq - seq);
++
++			memcpy(block + cur_len, (*skb)->data + offset,
++			       num_bytes);
++			cur_len += num_bytes;
++			seq += num_bytes;
++		}
++
++		if (*skb == skb_peek_tail(queue) || cur_len >= block_len)
++			break;
++
++		*skb = skb_queue_next(queue, *skb);
++	}
++
++	return cur_len;
++}
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 3260498..4d17c5f 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -107,6 +107,7 @@ int sysctl_tcp_early_retrans __read_mostly = 3;
+ #define FLAG_SYN_ACKED		0x10 /* This ACK acknowledged SYN.		*/
+ #define FLAG_DATA_SACKED	0x20 /* New SACK.				*/
+ #define FLAG_ECE		0x40 /* ECE in this ACK				*/
++#define FLAG_FEC_CWR_REQUESTED	0x80 /* cwnd reduction requested */
+ #define FLAG_SLOWPATH		0x100 /* Do not skip RFC checks for window update.*/
+ #define FLAG_ORIG_SACK_ACKED	0x200 /* Never retransmitted data are (s)acked	*/
+ #define FLAG_SND_UNA_ADVANCED	0x400 /* Snd_una was changed (!= FLAG_DATA_ACKED) */
+@@ -116,8 +117,9 @@ int sysctl_tcp_early_retrans __read_mostly = 3;
+ 
+ #define FLAG_ACKED		(FLAG_DATA_ACKED|FLAG_SYN_ACKED)
+ #define FLAG_NOT_DUP		(FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED)
+-#define FLAG_CA_ALERT		(FLAG_DATA_SACKED|FLAG_ECE)
++#define FLAG_CA_ALERT	(FLAG_DATA_SACKED|FLAG_ECE|FLAG_FEC_CWR_REQUESTED)
+ #define FLAG_FORWARD_PROGRESS	(FLAG_ACKED|FLAG_DATA_SACKED)
++#define FLAG_CONGESTION		(FLAG_ECE|FLAG_FEC_CWR_REQUESTED)
+ 
+ #define TCP_REMNANT (TCP_FLAG_FIN|TCP_FLAG_URG|TCP_FLAG_SYN|TCP_FLAG_PSH)
+ #define TCP_HP_BITS (~(TCP_RESERVED_BITS|TCP_FLAG_PSH))
+@@ -2536,7 +2538,8 @@ void tcp_enter_cwr(struct sock *sk, const int set_ssthresh)
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 
+ 	tp->prior_ssthresh = 0;
+-	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
++	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR &&
++	    after(tp->snd_una, tp->high_seq)) {
+ 		tp->undo_marker = 0;
+ 		tcp_init_cwnd_reduction(sk, set_ssthresh);
+ 		tcp_set_ca_state(sk, TCP_CA_CWR);
+@@ -3195,7 +3198,7 @@ static inline bool tcp_ack_is_dubious(const struct sock *sk, const int flag)
+ static inline bool tcp_may_raise_cwnd(const struct sock *sk, const int flag)
+ {
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+-	return (!(flag & FLAG_ECE) || tp->snd_cwnd < tp->snd_ssthresh) &&
++	return (!(flag & FLAG_CONGESTION) || tp->snd_cwnd < tp->snd_ssthresh) &&
+ 		!tcp_in_cwnd_reduction(sk);
+ }
+ 
+@@ -3363,6 +3366,10 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+ 	if (after(ack, prior_snd_una))
+ 		flag |= FLAG_SND_UNA_ADVANCED;
+ 
++	/* Check if FEC expects and executes a window reduction */
++	if (tcp_fec_is_enabled(tp) && tcp_fec_check_ack(sk, ack))
++		flag |= FLAG_FEC_CWR_REQUESTED;
++
+ 	prior_fackets = tp->fackets_out;
+ 	prior_in_flight = tcp_packets_in_flight(tp);
+ 
+@@ -4059,6 +4066,9 @@ static void tcp_ofo_queue(struct sock *sk)
+ 			   tp->rcv_nxt, TCP_SKB_CB(skb)->seq,
+ 			   TCP_SKB_CB(skb)->end_seq);
+ 
++		if (tcp_fec_is_enabled(tp))
++			tcp_fec_update_queue(sk, skb);
++
+ 		__skb_unlink(skb, &tp->out_of_order_queue);
+ 		__skb_queue_tail(&sk->sk_receive_queue, skb);
+ 		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+@@ -4335,6 +4345,9 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
+ 			goto out_of_window;
+ 
+ 		/* Ok. In sequence. In window. */
++		if (tcp_fec_is_enabled(tp))
++			tcp_fec_update_queue(sk, skb);
++
+ 		if (tp->ucopy.task == current &&
+ 		    tp->copied_seq == tp->rcv_nxt && tp->ucopy.len &&
+ 		    sock_owned_by_user(sk) && !tp->urg_data) {
+@@ -4653,6 +4666,12 @@ static int tcp_prune_queue(struct sock *sk)
+ 			     tp->copied_seq, tp->rcv_nxt);
+ 	sk_mem_reclaim(sk);
+ 
++	/* Disable FEC if it was enabled to prevent keeping data
++	 * in the receive queue longer than necessary
++	 */
++	if (tcp_fec_is_enabled(tp))
++		tcp_fec_disable(sk);
++
+ 	if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf)
+ 		return 0;
+ 
+@@ -5010,6 +5029,21 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
+ 		/* Reset is accepted even if it did not pass PAWS. */
+ 	}
+ 
++	/* Special processing if FEC is enabled */
++	if (tcp_fec_is_enabled(tp)) {
++		if (tcp_fec_is_encoded(tp)) {
++			tcp_fec_process(sk, skb);
++			goto discard;
++		} else if (!tp->rx_opt.fec.saw_fec && th->ack &&
++			   sk->sk_state == TCP_LAST_ACK) {
++			/* TODO Sometimes the FEC option is not appended to the
++			 * FIN-ACK packet; socket options cleared?
++			 */
++			tcp_ack(sk, skb, FLAG_SLOWPATH);
++			goto discard;
++		}
++	}
++
+ 	/* Step 1: check sequence number */
+ 	if (!tcp_sequence(tp, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq)) {
+ 		/* RFC793, page 37: "In all states except SYN-SENT, all reset
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 1d0bf2f..acfc144 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -483,6 +483,8 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
+ 		newtp->fastopen_rsk = NULL;
+ 		newtp->syn_data_acked = 0;
+ 
++		newtp->high_seq = newtp->snd_nxt;
++
+ 		/* TCP FEC option */
+ 		newtp->rx_opt.fec.type = sysctl_tcp_fec ? req->fec_type : 0;
+ 		newtp->fec.type = newtp->fec.flags = 0;
+-- 
+2.1.0.rc2.206.gedb03e5
+

@@ -1,0 +1,653 @@
+From 928d69eec0343e39ecb3560e095b5c16d8d9977a Mon Sep 17 00:00:00 2001
+From: Tobias Flach <flach@google.com>
+Date: Mon, 25 Aug 2014 16:47:33 -0700
+Subject: [PATCH] net-tcp: TCP with Forward Error Correction (Sender)
+
+Implementation of the sender part of forward error correction in TCP.
+
+Implemented components:
+* FEC payload construction and transmission (encoding):
+  - The FEC mechanism is invoked after 1/4 RTT after a transmission
+    (can be a GSO/TSO packet).
+  - The encoding scheme is negotiated during connection setup. In
+    the case of the basic XOR, it XORs all byte blocks (ignoring packet
+    boundaries, but using the current MSS as the block size) which
+    were already transmitted but never FEC-encoded before.
+    Depending on the specified maximum number of bytes per FEC payload
+    (see FEC_RCV_QUEUE_LIMIT), it is possible that multiple FEC packets are
+    generated in this step.
+  - Currently, the FEC option carries the length of the sequence
+    range used for encoding (that is, sequence number of the last
+    encoded byte minus the sequence number of the first encoded byte).
+    This is sufficient to determine the length of
+    all encoded blocks on the receiver side (all blocks are MSS
+    bytes large, except for the last one).
+* sysctl_tcp_fec extension to toggle FEC transmit during loss episodes:
+  - Valid values are:
+    0 FEC is disabled
+    1 FEC is enabled except for loss episodes
+    2 FEC is enabled including for loss episodes
+---
+ include/net/inet_connection_sock.h |   4 +-
+ include/net/tcp_fec.h              |  26 +++
+ net/ipv4/inet_diag.c               |   3 +-
+ net/ipv4/sysctl_net_ipv4.c         |   3 +-
+ net/ipv4/tcp_fec.c                 | 396 +++++++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_input.c               |   6 +
+ net/ipv4/tcp_ipv4.c                |   3 +-
+ net/ipv4/tcp_output.c              |   5 +-
+ net/ipv4/tcp_timer.c               |  14 +-
+ 9 files changed, 454 insertions(+), 6 deletions(-)
+
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index de2c785..d13c597 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -135,6 +135,7 @@ struct inet_connection_sock {
+ #define ICSK_TIME_PROBE0	3	/* Zero window probe timer */
+ #define ICSK_TIME_EARLY_RETRANS 4	/* Early retransmit timer */
+ #define ICSK_TIME_LOSS_PROBE	5	/* Tail loss probe timer */
++#define ICSK_TIME_FEC		6	/* FEC delayed send timer */
+ 
+ static inline struct inet_connection_sock *inet_csk(const struct sock *sk)
+ {
+@@ -225,7 +226,8 @@ static inline void inet_csk_reset_xmit_timer(struct sock *sk, const int what,
+ 	}
+ 
+ 	if (what == ICSK_TIME_RETRANS || what == ICSK_TIME_PROBE0 ||
+-	    what == ICSK_TIME_EARLY_RETRANS || what ==  ICSK_TIME_LOSS_PROBE) {
++	    what == ICSK_TIME_EARLY_RETRANS || what ==  ICSK_TIME_LOSS_PROBE ||
++	    what == ICSK_TIME_FEC) {
+ 		icsk->icsk_pending = what;
+ 		icsk->icsk_timeout = jiffies + when;
+ 		sk_reset_timer(sk, &icsk->icsk_retransmit_timer, icsk->icsk_timeout);
+diff --git a/include/net/tcp_fec.h b/include/net/tcp_fec.h
+index 1660e58..38f2c40 100644
+--- a/include/net/tcp_fec.h
++++ b/include/net/tcp_fec.h
+@@ -12,6 +12,9 @@
+ 
+ #define TCP_FEC_NUM_TYPES		3
+ 
++/* Delay transmission of FEC packets (delay defined in tcp_fec_arm_timer()) */
++#define TCP_FEC_DELAYED_SEND		1
++
+ /*
+  * Returns true if FEC is enabled for the socket
+  */
+@@ -77,4 +80,27 @@ int tcp_fec_update_queue(struct sock *sk, struct sk_buff *skb);
+  */
+ void tcp_fec_disable(struct sock *sk);
+ 
++/* Arms the timer for a delayed FEC transmission if there is
++ * no earlier timeout defined (i.e. retransmission timeout)
++ */
++void tcp_fec_arm_timer(struct sock *sk);
++
++/* The FEC timer fired. Force an FEC transmission for the
++ * last unencoded burst. Rearm the RTO timer (which was switched
++ * out when setting the FEC timer). Set a new FEC timer if there
++ * is pending unencoded data.
++ */
++void tcp_fec_timer(struct sock *sk);
++
++/* If FEC packets transmissions are delayed set a timer
++ * (if not already set), otherwise invoke the FEC mechanism
++ * immediately
++ */
++int tcp_fec_invoke(struct sock *sk);
++
++/* Invoke the FEC mechanism set for the connection;
++ * Create and sends out FEC packets
++ */
++int tcp_fec_invoke_nodelay(struct sock *sk);
++
+ #endif
+diff --git a/net/ipv4/inet_diag.c b/net/ipv4/inet_diag.c
+index 5f64875..e151283 100644
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@ -160,7 +160,8 @@ int inet_sk_diag_fill(struct sock *sk, struct inet_connection_sock *icsk,
+ 
+ 	if (icsk->icsk_pending == ICSK_TIME_RETRANS ||
+ 	    icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS ||
+-	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE) {
++	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE ||
++	    icsk->icsk_pending == ICSK_TIME_FEC) {
+ 		r->idiag_timer = 1;
+ 		r->idiag_retrans = icsk->icsk_retransmits;
+ 		r->idiag_expires = EXPIRES_IN_MS(icsk->icsk_timeout);
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 42ea051..389900f 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -28,6 +28,7 @@
+ 
+ static int zero;
+ static int one = 1;
++static int two = 2;
+ static int four = 4;
+ static int tcp_retr1_max = 255;
+ static int ip_local_port_range_min[] = { 1, 1 };
+@@ -778,7 +779,7 @@ static struct ctl_table ipv4_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 		.extra1		= &zero,
+-		.extra2		= &one,
++		.extra2		= &two,
+ 	},
+ 	{ }
+ };
+diff --git a/net/ipv4/tcp_fec.c b/net/ipv4/tcp_fec.c
+index 3a8bd6d..7f04e49 100644
+--- a/net/ipv4/tcp_fec.c
++++ b/net/ipv4/tcp_fec.c
+@@ -19,12 +19,30 @@ static struct sk_buff *tcp_fec_make_decoded_pkt(struct sock *sk,
+ 			const struct sk_buff *skb, unsigned char *dec_data,
+ 			u32 seq, unsigned int len);
+ 
++/* Sender routines */
++static int tcp_fec_create(struct sock *sk, struct sk_buff_head *list);
++static int tcp_fec_create_xor(struct sock *sk, struct sk_buff_head *list,
++			unsigned int first_seq, unsigned int block_len,
++			unsigned int block_skip,
++			unsigned int max_encoded_per_pkt);
++static struct sk_buff *tcp_fec_make_encoded_pkt(struct sock *sk,
++			struct tcp_fec *fec, unsigned char *enc_data,
++			u32 seq);
++static int tcp_fec_xmit_all(struct sock *sk, struct sk_buff_head *list);
++static int tcp_fec_xmit(struct sock *sk, struct sk_buff *skb);
++
+ /* Buffer access routine */
+ static unsigned int tcp_fec_get_next_block(struct sock *sk,
+ 			struct sk_buff **skb, struct sk_buff_head *queue,
+ 			u32 seq, unsigned int block_len,
+ 			unsigned char *block);
+ 
++/* Have to define this signature here since the actual function was static
++ * and tcp_output.c has no corresponding header file
++ */
++extern int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
++			gfp_t gfp_mask);
++
+ /* Decodes FEC parameters and stores them in the FEC struct
+  * @seq - sequence number of the packet
+  * @ack_seq - ACKed sequence number
+@@ -854,3 +872,381 @@ static unsigned int tcp_fec_get_next_block(struct sock *sk,
+ 
+ 	return cur_len;
+ }
++
++/* Arms the timer for a delayed FEC transmission if there is
++ * no earlier timeout defined (i.e. retransmission timeout)
++ */
++void tcp_fec_arm_timer(struct sock *sk)
++{
++	struct inet_connection_sock *icsk;
++	struct tcp_sock *tp;
++	u32 delta, timeout, rtt;
++
++	icsk = inet_csk(sk);
++	tp = tcp_sk(sk);
++
++	/* Only arm a timer if connection is established */
++	if (sk->sk_state != TCP_ESTABLISHED)
++		return;
++
++	/* Forward next sequence to be encoded if unencoded data was acked */
++	if (after(tp->snd_una, tp->fec.next_seq))
++		tp->fec.next_seq = tp->snd_una;
++
++	/* Don't arm the timer if there is no unencoded data left */
++	if (!before(tp->fec.next_seq, tp->snd_nxt))
++		return;
++
++	/* TODO handle other timers which might be armed;
++	 * EARLY_RETRANS? LOSS_PROBE?
++	 */
++
++	/* Compute timeout (currently 0.25 * RTT) */
++	rtt = tp->srtt >> 3;
++	timeout = rtt >> 2;
++
++	/* Compute delay between transmission of original packet and this call
++	 * (difference is subtracted from timeout value)
++	 */
++	delta = 0;
++	if (delta > timeout) {
++		tcp_fec_invoke_nodelay(sk);
++		return;
++	} else if (delta > 0) {
++		timeout -= delta;
++	}
++
++	/* Do not replace a timeout occurring earlier */
++	if (jiffies + timeout >= icsk->icsk_timeout)
++		return;
++
++	inet_csk_reset_xmit_timer(sk, ICSK_TIME_FEC, timeout, TCP_RTO_MAX);
++}
++
++/* The FEC timer fired. Force an FEC transmission for the
++ * last unencoded burst. Rearm the RTO timer (which was switched
++ * out when setting the FEC timer). Set a new FEC timer if there
++ * is pending unencoded data.
++ */
++void tcp_fec_timer(struct sock *sk)
++{
++	struct inet_connection_sock *icsk;
++	struct tcp_sock *tp;
++
++	icsk = inet_csk(sk);
++	tp = tcp_sk(sk);
++
++	tcp_fec_invoke_nodelay(sk);
++
++	icsk->icsk_pending = 0;
++	tcp_rearm_rto(sk);
++
++	tcp_fec_arm_timer(sk);
++}
++
++/* If FEC packet transmissions are delayed set a timer
++ * (if not already set), otherwise invoke the FEC mechanism
++ * immediately
++ */
++int tcp_fec_invoke(struct sock *sk)
++{
++	struct inet_connection_sock *icsk;
++	struct tcp_sock *tp;
++
++	icsk = inet_csk(sk);
++	tp = tcp_sk(sk);
++
++#ifndef TCP_FEC_DELAYED_SEND
++	return tcp_fec_invoke_nodelay(sk);
++#else
++	/* Set the timer for sending an FEC packet if no FEC
++	 * timer is active yet
++	 */
++	if (!icsk->icsk_pending || icsk->icsk_pending != ICSK_TIME_FEC)
++		tcp_fec_arm_timer(sk);
++#endif
++
++	return 0;
++}
++
++/* Invokes the FEC mechanism set for the connection;
++ * Creates and sends out FEC packets
++ */
++int tcp_fec_invoke_nodelay(struct sock *sk)
++{
++	int err;
++	struct sk_buff_head *list;
++	struct sk_buff *skb;
++	struct tcp_fec *fec;
++
++	list = kmalloc(sizeof(struct sk_buff_head), GFP_ATOMIC);
++	if (list == NULL)
++		return -ENOMEM;
++
++	skb_queue_head_init(list);
++	err = tcp_fec_create(sk, list);
++	if (err)
++		goto clean;
++
++	err = tcp_fec_xmit_all(sk, list);
++	if (err)
++		goto clean;
++
++clean:
++	/* Purge all SKBs (purge FEC structs first) */
++	skb = (struct sk_buff *) list;
++	while (!skb_queue_is_last(list, skb)) {
++		skb = skb_queue_next(list, skb);
++		fec = TCP_SKB_CB(skb)->fec;
++		if (fec != NULL) {
++			kfree(fec);
++			TCP_SKB_CB(skb)->fec = NULL;
++		}
++	}
++
++	skb_queue_purge(list);
++	kfree(list);
++
++	/* TODO error handling; -ENOMEM, etc. - disable FEC? */
++
++	return err;
++}
++
++/* Creates one or more FEC packets (can depend on the FEC type used)
++ * and puts them in a queue
++ * @list: queue head
++ */
++static int tcp_fec_create(struct sock *sk, struct sk_buff_head *list)
++{
++	struct tcp_sock *tp;
++	unsigned int first_seq, block_len;
++	int err;
++
++	tp = tcp_sk(sk);
++
++	/* Update the pointer to the first byte to be encoded next
++	 * (this only matters when a packet was ACKed before it was
++	 * encoded)
++	 */
++	if (after(tp->snd_una, tp->fec.next_seq))
++		tp->fec.next_seq = tp->snd_una;
++
++	first_seq = tp->fec.next_seq;
++	block_len = tcp_current_mss(sk);
++
++	switch (tp->fec.type) {
++	case TCP_FEC_TYPE_NONE:
++		return 0;
++	case TCP_FEC_TYPE_XOR_ALL:
++		return tcp_fec_create_xor(sk, list, first_seq,
++					  block_len, 0,
++					  FEC_RCV_QUEUE_LIMIT - block_len);
++	case TCP_FEC_TYPE_XOR_SKIP_1:
++		err = tcp_fec_create_xor(sk, list, first_seq, block_len, 1,
++					  FEC_RCV_QUEUE_LIMIT - block_len);
++		if (err)
++			return err;
++
++		return tcp_fec_create_xor(sk, list, first_seq + block_len,
++					  block_len, 1,
++					  FEC_RCV_QUEUE_LIMIT - block_len);
++	}
++
++	return 0;
++}
++
++/* Creates FEC packet(s) using XOR encoding
++ * (allocates memory for the FEC structs)
++ * @first_seq - Sequence number of first byte to be encoded
++ * @block_len - Block length (typically MSS)
++ * @block_skip - Number of unencoded blocks between two encoded blocks
++ * @max_encoded_per_pkt - maximum number of blocks encoded per packet
++ *	(0, if unlimited)
++ */
++static int tcp_fec_create_xor(struct sock *sk, struct sk_buff_head *list,
++				unsigned int first_seq, unsigned int block_len,
++				unsigned int block_skip,
++				unsigned int max_encoded_per_pkt)
++{
++	struct tcp_sock *tp;
++	struct sk_buff *skb, *fskb;
++	struct tcp_fec *fec;
++	unsigned int c_encoded;		/* Number of currently encoded blocks
++					   not yet added to an FEC packet */
++        unsigned int next_seq;          /* Next byte to encode */
++        unsigned int i;
++	unsigned char *data, *block;
++	u16 data_len;
++
++	tp = tcp_sk(sk);
++	skb = NULL;
++	c_encoded = 0;
++	next_seq = first_seq;
++
++	/* memory allocation
++	 * data - used temporarily to obtain byte blocks and store the payload
++		  (is freed before returning; we need two blocks here to store
++                   the previously XORed data that has not been added to an FEC
++                   packet yet, and the new to-be XORed data extracted from one
++                   or more existing buffers)
++
++	 * fec	- used to store the FEC parameters
++		  (is freed after the corresponding packet is forwarded to the
++		  transmission routine)
++	 */
++	data = kmalloc(2 * block_len, GFP_ATOMIC);
++	if (data == NULL)
++		return -ENOMEM;
++
++	fec = kmalloc(sizeof(struct tcp_fec), GFP_ATOMIC);
++	if (fec == NULL) {
++		kfree(data);
++		return -ENOMEM;
++	}
++
++	memset(data, 0, 2 * block_len);
++	memset(fec, 0, sizeof(struct tcp_fec));
++
++	block = data + block_len;
++
++	/* encode data blocks
++	 * XXX atomicity check?
++	 */
++	fec->enc_seq = next_seq;
++	while ((data_len = tcp_fec_get_next_block(sk, &skb,
++				&sk->sk_write_queue, next_seq,
++				min(block_len, tp->snd_nxt - next_seq),
++				block))) {
++		/* Check if we reached the encoding limit; then create packet
++		 * with current payload and add it to the queue
++		 */
++		if (max_encoded_per_pkt > 0 &&
++					c_encoded >= max_encoded_per_pkt) {
++			fskb = tcp_fec_make_encoded_pkt(sk, fec, data,
++						block_len);
++			if (fskb == NULL) {
++				kfree(data);
++				kfree(fec);
++				return -EINVAL;
++			}
++
++			skb_queue_tail(list, fskb);
++			memset(data, 0, block_len);
++			c_encoded = 0;
++
++			/* memory allocation for the FEC struct of the next
++			 * packet
++			 */
++			fec = kmalloc(sizeof(struct tcp_fec), GFP_ATOMIC);
++			if (fec == NULL) {
++				kfree(data);
++				return -ENOMEM;
++			}
++
++			memset(fec, 0, sizeof(struct tcp_fec));
++			fec->enc_seq = next_seq;
++		}
++
++		next_seq += data_len;
++		fec->enc_len = next_seq - fec->enc_seq;
++
++		/* encode block into existing payload (XOR) */
++		for (i = 0; i < data_len; i++)
++			data[i] ^= block[i];
++
++		c_encoded++;
++
++		/* skip over blocks which are not requested for encoding */
++		next_seq += block_len * block_skip;
++	}
++
++	/* create final packet if some data was selected for encoding */
++	if (c_encoded > 0) {
++		fskb = tcp_fec_make_encoded_pkt(sk, fec, data, block_len);
++		if (fskb == NULL) {
++			kfree(data);
++			kfree(fec);
++			return -EINVAL;
++		}
++
++		skb_queue_tail(list, fskb);
++	} else {
++		kfree(fec);
++	}
++
++	tp->fec.next_seq = next_seq;
++	kfree(data);
++
++	return 0;
++}
++
++/* Allocates an SKB for data we want to send and assigns
++ * the necessary options and fields
++ */
++static struct sk_buff *tcp_fec_make_encoded_pkt(struct sock *sk,
++				struct tcp_fec *fec,
++				unsigned char *enc_data,
++				unsigned int len)
++{
++	struct sk_buff *skb;
++	unsigned char *data;
++
++	/* See tcp_make_synack(); 15 probably for tail pointer etc.? */
++	len = min(len, fec->enc_len);
++	skb = alloc_skb(MAX_TCP_HEADER + 15 + len, GFP_ATOMIC);
++	if (skb == NULL)
++		return NULL;
++
++	/* Reserve space for headers */
++	skb_reserve(skb, MAX_TCP_HEADER);
++
++	/* Specify sequence number and FEC struct address in control buffer */
++	fec->flags |= TCP_FEC_ENCODED;
++	TCP_SKB_CB(skb)->seq = fec->enc_seq;
++	TCP_SKB_CB(skb)->fec = fec;
++
++	/* Enable ACK flag (required for all data packets) */
++	TCP_SKB_CB(skb)->tcp_flags = TCPHDR_ACK;
++
++	/* Set GSO parameters */
++	skb_shinfo(skb)->gso_segs = 1;
++	skb_shinfo(skb)->gso_size = 0;
++	skb_shinfo(skb)->gso_type = 0;
++
++	/* Append payload to SKB */
++	data = skb_put(skb, len);
++	memcpy(data, enc_data, len);
++
++	skb->ip_summed = CHECKSUM_PARTIAL;
++
++	return skb;
++}
++
++/* Transmit all FEC packets in a list */
++static int tcp_fec_xmit_all(struct sock *sk, struct sk_buff_head *list)
++{
++	struct sk_buff *skb;
++	int err;
++
++	if (list == NULL || skb_queue_empty(list))
++		return 0;
++
++	skb = (struct sk_buff *) list;
++	while (!skb_queue_is_last(list, skb)) {
++		skb = skb_queue_next(list, skb);
++		err = tcp_fec_xmit(sk, skb);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++/* Transmits an FEC packet */
++static int tcp_fec_xmit(struct sock *sk, struct sk_buff *skb)
++{
++	/* TODO timers? no retransmissions, but want to deactivate FEC
++	 * if we never get any FEC ACKs back
++	 */
++	return tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);
++}
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 4d17c5f..e1b70bf 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -2938,6 +2938,12 @@ void tcp_rearm_rto(struct sock *sk)
+ 	if (tp->fastopen_rsk)
+ 		return;
+ 
++	/* Don't rearm the timer if an FEC timer is active.
++	 * The FEC handler will rearm the timer once the event is handled.
++	 */
++	if (icsk->icsk_pending == ICSK_TIME_FEC)
++		return;
++
+ 	if (!tp->packets_out) {
+ 		inet_csk_clear_xmit_timer(sk, ICSK_TIME_RETRANS);
+ 	} else {
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 04e3bf0..d97fb04 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -2667,7 +2667,8 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i, int *len)
+ 
+ 	if (icsk->icsk_pending == ICSK_TIME_RETRANS ||
+ 	    icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS ||
+-	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE) {
++	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE ||
++	    icsk->icsk_pending == ICSK_TIME_FEC) {
+ 		timer_active	= 1;
+ 		timer_expires	= icsk->icsk_timeout;
+ 	} else if (icsk->icsk_pending == ICSK_TIME_PROBE0) {
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 00daf84..cba34c0 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -864,7 +864,7 @@ void tcp_wfree(struct sk_buff *skb)
+  * We are working here with either a clone of the original
+  * SKB, or a fresh unique copy made by the retransmit engine.
+  */
+-static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
++int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+ 			    gfp_t gfp_mask)
+ {
+ 	const struct inet_connection_sock *icsk = inet_csk(sk);
+@@ -1936,6 +1936,9 @@ repair:
+ 			break;
+ 	}
+ 
++	if (tcp_fec_is_enabled(tp))
++		tcp_fec_invoke(sk);
++
+ 	if (likely(sent_pkts)) {
+ 		if (tcp_in_cwnd_reduction(sk))
+ 			tp->prr_out += sent_pkts;
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index 4b85e6f..b2808d4 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -21,6 +21,7 @@
+ #include <linux/module.h>
+ #include <linux/gfp.h>
+ #include <net/tcp.h>
++#include <net/tcp_fec.h>
+ 
+ int sysctl_tcp_syn_retries __read_mostly = TCP_SYN_RETRIES;
+ int sysctl_tcp_synack_retries __read_mostly = TCP_SYNACK_RETRIES;
+@@ -472,7 +473,15 @@ out_reset_timer:
+ 	if (retransmits_timed_out(sk, sysctl_tcp_retries1 + 1, 0, 0))
+ 		__sk_dst_reset(sk);
+ 
+-out:;
++out:
++	/* FEC will switch out the RTO timer if a delayed FEC transmission
++	 * should happen earlier than this. RTO timer will be switched in
++	 * once the FEC timer fired.
++	 * FEC transmissions during a loss episode require that the sysctl
++	 * value is >= 2.
++	 */
++	if (tcp_fec_is_enabled(tp) && sysctl_tcp_fec >= 2)
++		tcp_fec_arm_timer(sk);
+ }
+ 
+ void tcp_write_timer_handler(struct sock *sk)
+@@ -497,6 +506,9 @@ void tcp_write_timer_handler(struct sock *sk)
+ 	case ICSK_TIME_LOSS_PROBE:
+ 		tcp_send_loss_probe(sk);
+ 		break;
++	case ICSK_TIME_FEC:
++		tcp_fec_timer(sk);
++		break;
+ 	case ICSK_TIME_RETRANS:
+ 		icsk->icsk_pending = 0;
+ 		tcp_retransmit_timer(sk);
+-- 
+2.1.0.rc2.206.gedb03e5
+
